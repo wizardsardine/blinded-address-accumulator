@@ -1,59 +1,32 @@
 use std::{collections::BTreeSet, fmt::Display, str::FromStr};
 
-use crate::crypto::{HmacEngine, PublicKey, Sha256Engine};
+use crate::crypto::{Crypto, Sha256Engine};
 
-#[derive(Ord, PartialOrd, Eq, PartialEq)]
-pub struct XPub {
-    pub public_key: PublicKey,
-    pub chain_code: [u8; 32],
+pub trait XpubImpl: Ord {
+    fn public_key(&self) -> [u8; 33];
+    fn chain_code(&self) -> [u8; 32];
 }
 
-pub struct Descriptor {
-    key_digest: [u8; 32],
-}
+pub trait DescriptorImpl: Display + FromStr {
+    type Xpub: XpubImpl;
 
-impl Display for Descriptor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // NOTE: we need the descriptor string to be non malleable, like enforcing
-        // ' as hardening indicator and enforcing fingerprint
-        todo!()
-    }
-}
+    fn xpubs(&self) -> Vec<Self::Xpub>;
+    fn recv_script_at(&self, index: u32) -> Vec<u8>;
+    fn bytes(&self) -> Vec<u8>;
 
-impl FromStr for Descriptor {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        todo!()
-    }
-}
-
-impl Descriptor {
-    pub fn xpubs(&self) -> Vec<XPub> {
-        // TODO: return xpubs in descriptor order
-        todo!()
-    }
-    pub fn recv_script_at(&self, index: u32) -> Vec<u8> {
-        todo!()
-    }
-
-    pub fn policy_id(&self) -> [u8; 32] {
-        let mut engine = Sha256Engine::new();
-        engine.input(self.to_string().as_bytes());
+    fn policy_id<C: Crypto>(&self) -> [u8; 32] {
+        let mut engine = C::Sha256Engine::new();
+        engine.input(&self.bytes());
         engine.hash()
     }
 
-    pub fn compute_keys_digest(&self) -> [u8; 32] {
-        let xpubs: BTreeSet<XPub> = self.xpubs().into_iter().collect();
-        let mut engine = Sha256Engine::new();
+    fn keys_digest<C: Crypto>(&self) -> [u8; 32] {
+        let xpubs: BTreeSet<Self::Xpub> = self.xpubs().into_iter().collect();
+        let mut engine = C::Sha256Engine::new();
         for xpub in xpubs {
-            engine.input(&xpub.chain_code);
-            engine.input(&xpub.public_key.raw());
+            engine.input(&xpub.chain_code());
+            engine.input(&xpub.public_key());
         }
         engine.hash()
-    }
-
-    pub fn keys_digest(&self) -> &[u8; 32] {
-        &self.key_digest
     }
 }
