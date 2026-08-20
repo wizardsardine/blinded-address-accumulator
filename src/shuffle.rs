@@ -33,12 +33,19 @@ pub const SHUFFLE_TAG: &[u8] = "BIPXXX_SHUFFLE".as_bytes();
 /// be read in wider units and the rejection bound below changes with it.
 pub const MAX_RANGE: usize = 256;
 
-/// Derive the shuffle key from the descriptor keys digest.
+/// Derive the shuffle key from the wallet policy id, the keychain, and the
+/// tree start.
 ///
-/// Domain-separated from the digest itself so this key has a single purpose.
-pub fn shuffle_key<C: Crypto>(keys_digest: &[u8; 32]) -> [u8; 32] {
+/// Domain-separated so this key has a single purpose. Binding the policy id,
+/// the keychain, and the tree start gives each tree its own permutation: two
+/// trees never share one, even across keychains at equal starts or across
+/// policies over the same keys, so proofs cannot be linked across trees by
+/// tree position.
+pub fn shuffle_key<C: Crypto>(policy_id: &[u8; 32], keychain: u32, start_index: u32) -> [u8; 32] {
     let mut engine = C::Sha256Engine::new_tagged(SHUFFLE_TAG);
-    engine.input(keys_digest);
+    engine.input(policy_id);
+    engine.input(&keychain.to_be_bytes());
+    engine.input(&start_index.to_be_bytes());
     engine.hash()
 }
 

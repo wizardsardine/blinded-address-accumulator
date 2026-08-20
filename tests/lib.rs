@@ -3,8 +3,8 @@ use std::{collections::BTreeSet, fmt, str::FromStr, str::Utf8Error};
 use blinded_secret_accumulator::{
     crypto::{Crypto, HmacEngine, Sha256Engine},
     descriptor::{DescriptorImpl, XpubImpl},
-    final_tree,
-    shuffle::{MAX_RANGE, invert, shuffle_order},
+    generate_tree,
+    shuffle::{MAX_RANGE, invert, shuffle_key, shuffle_order},
     tree::{HEIGHT, Leaf, Node, ProofTreeBuilder, TreeBuilder, sibling_position, verify_proof},
 };
 use miniscript::bitcoin::{
@@ -277,6 +277,22 @@ fn shuffle_is_key_dependent() {
 }
 
 #[test]
+fn shuffle_is_tree_bound() {
+    let policy_id = [0x42u8; 32];
+    let a = shuffle_order::<TestCrypto>(shuffle_key::<TestCrypto>(&policy_id, 0, 0));
+    let b = shuffle_order::<TestCrypto>(shuffle_key::<TestCrypto>(&policy_id, 0, 1));
+    assert_ne!(a, b);
+}
+
+#[test]
+fn shuffle_is_keychain_bound() {
+    let policy_id = [0x42u8; 32];
+    let a = shuffle_order::<TestCrypto>(shuffle_key::<TestCrypto>(&policy_id, 0, 0));
+    let b = shuffle_order::<TestCrypto>(shuffle_key::<TestCrypto>(&policy_id, 1, 0));
+    assert_ne!(a, b);
+}
+
+#[test]
 fn proof_tree_returns_proof_for_absolute_index() {
     let start_index = 512;
     let mut builder = ProofTreeBuilder::new(start_index);
@@ -285,7 +301,7 @@ fn proof_tree_returns_proof_for_absolute_index() {
         let offset = MAX_RANGE - 1 - local_pos;
         let index = start_index + offset as u32;
         builder.leaf(
-            start_index + local_pos as u32,
+            local_pos as u32,
             index,
             &hash(0, local_pos),
             &[offset as u8; 32],
@@ -297,7 +313,7 @@ fn proof_tree_returns_proof_for_absolute_index() {
             builder.node(
                 level as u8,
                 Node {
-                    position: (start_index >> level) + local_pos as u32,
+                    position: local_pos as u32,
                     hash: hash(level, local_pos),
                 },
             );
@@ -308,13 +324,12 @@ fn proof_tree_returns_proof_for_absolute_index() {
     let proof = tree.proof_of(start_index + 111).expect("proof");
 
     assert_eq!(proof.nonce, [111u8; 32]);
-    assert_eq!(proof.position, start_index + 144);
+    assert_eq!(proof.position, 144);
     for level in 0..HEIGHT {
         let sibling_pos = sibling_position(proof.position, level as u8);
-        let local_pos = sibling_pos - (start_index >> level);
         assert_eq!(
             proof.siblings.expect("siblings")[level],
-            hash(level, local_pos as usize)
+            hash(level, sibling_pos as usize)
         );
     }
 }
@@ -326,7 +341,7 @@ fn proof_tree_returns_none_outside_tree() {
 
     for offset in 0..MAX_RANGE {
         builder.leaf(
-            start_index + offset as u32,
+            offset as u32,
             start_index + offset as u32,
             &hash(0, offset),
             &[offset as u8; 32],
@@ -351,28 +366,29 @@ fn verify_proof_without_siblings_fails() {
 }
 
 #[test]
-fn final_tree_verifies_all_proofs() {
-    let start_index = 512;
-    let descriptor = liana_descriptor();
-    let keys_digest = descriptor.keys_digest::<TestCrypto>();
-    let (_, tree) = final_tree::<TestCrypto, _>(
-        [1u8; 32],
-        &keys_digest,
-        0,
-        start_index,
-        |index| descriptor.recv_script_at(index),
-        ProofTreeBuilder::new(start_index),
-    );
+fn generate_tree_verifies_all_proofs() {
+    for start_index in [0u32, 1, 300, 512] {
+        let descriptor = liana_descriptor();
+        let keys_digest = descriptor.keys_digest::<TestCrypto>();
+        let policy_id = descriptor.policy_id::<TestCrypto>();
+        let tree = generate_tree::<TestCrypto, _>(
+            policy_id,
+            &keys_digest,
+            0,
+            start_index,
+            |index| descriptor.recv_script_at(index),
+            ProofTreeBuilder::new(start_index),
+        );
 
-    for offset in 0..MAX_RANGE {
-        let index = start_index + offset as u32;
-        let leaf = tree.proof_of(index).expect("proof");
+        for offset in 0..MAX_RANGE {
+            let index = start_index + offset as u32;
+            let leaf = tree.proof_of(index).expect("proof");
 
-        assert!(leaf.siblings.is_some());
-        assert!(verify_proof::<TestCrypto>(
-            &descriptor.recv_script_at(index),
-            &leaf,
-            &tree.root
-        ));
+            assert!(leaf.siblings.is_some());
+            assert!(
+                verify_proof::<TestCrypto>(&descriptor.recv_script_at(index), &leaf, &tree.root),
+                "start_index {start_index} offset {offset}"
+            );
+        }
     }
 }

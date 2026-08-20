@@ -80,34 +80,47 @@ final assigned number in every tag string.
 | Internal node | `BIPXXX_BRANCH` |
 | Root | `BIPXXX_ROOT` |
 | Nonce derivation | `BIPXXX_NONCE` |
+| Chaincode seed | `BIPXXX_POLICY` |
 | Shuffle key and stream | `BIPXXX_SHUFFLE` |
 | Proof of Recipient | `BIPXXX_POR` |
 
 ### Nonce derivation
 
 Leaf blinding material derives from a rolling chaincode and the descriptor keys
-digest.
+digest. The rolling chaincode is seeded per tree from the wallet policy id, the
+keychain, and the tree start, so two trees never share a chaincode state and a
+leaf nonce is unique to its tree even when trees overlap in derivation index
+space.
 
 ```
-policy_id  = sha256(canonical_wallet_policy)
-key_digest = sha256(concat_all(sort(dedup(serialized_xpubs))))
+policy_id   = sha256(descriptor_bytes)
+keys_digest = sha256(concat_all(sort(dedup(concat(chain_code, public_key)))))
+
+policy_hash(policy_id, keychain, tree_start) =
+    tagged_hash("BIPXXX_POLICY",
+                concat(policy_id, be32(keychain), be32(tree_start)))
+
+chaincode = policy_hash(policy_id, keychain, tree_start)
 
 next_chaincode, nonce = split32(hmac_sha512(chaincode,
                                             concat("BIPXXX_NONCE",
-                                                   key_digest,
+                                                   keys_digest,
                                                    be32(keychain),
                                                    be32(index))))
 ```
 
-`canonical_wallet_policy` is the wallet policy serialization defined by
-BIP388. Implementations MUST NOT invent an alternate serialization.
+`descriptor_bytes` is the canonical string serialization of the wallet
+descriptor, encoded as UTF-8 with no added whitespace or trailing newline.
+`chain_code` and `public_key` are the 32-byte chain code and 33-byte
+compressed public key of each extended public key in the descriptor.
 
-`keychain` identifies the descriptor keychain. `be32(keychain)` and
-`be32(index)` are 32-bit big-endian unsigned integers.
+`keychain` identifies the descriptor keychain. `be32(keychain)`,
+`be32(index)`, and `be32(tree_start)` are 32-bit big-endian unsigned integers.
 
 Nonce derivation is sequential inside a tree. Each leaf consumes the current
 chaincode and produces the next chaincode and that leaf's nonce by splitting the
-64-byte HMAC output into two 32-byte halves.
+64-byte HMAC output into two 32-byte halves. The chaincode is NOT threaded
+across trees: each tree reseeds from `policy_id` and its own `tree_start`.
 
 ### Leaf construction
 
@@ -124,22 +137,25 @@ encoding.
 
 Each tree contains exactly 256 leaves. Each shuffled entry is a one-byte offset
 inside that tree. The absolute derivation index is the tree start plus that
-offset.
+offset. A tree MAY start at any derivation index; the start is not required to
+be a multiple of 256, and trees MAY overlap in derivation index space. The
+chaincode seed binds the keychain and the tree start, so overlapping trees
+produce disjoint nonces for the same index.
 
 ```
-build_tree(tree_start):
-    assert tree_start % 256 == 0
-
+generate_tree(tree_start):
     leaves = []
     nonces = []
+    chaincode = policy_hash(policy_id, keychain, tree_start)
     for offset in 0 .. 256:
         index = tree_start + offset
-        chaincode, nonce = leaf_nonce(chaincode, key_digest, keychain, index)
+        chaincode, nonce = leaf_nonce(chaincode, keys_digest, keychain, index)
         nonces[offset] = nonce
         leaves[offset] = leaf(script_pubkey(index), nonce)
 
     nodes = []
-    for each offset in shuffle_order(shuffle_key(keys_digest)):
+    for each offset in shuffle_order(shuffle_key(policy_id, keychain,
+                                                 tree_start)):
         nodes.append(leaves[offset])
 
     return root_hash(collapse(nodes))
@@ -155,14 +171,16 @@ branch_hash(left, right) = tagged_hash("BIPXXX_BRANCH",
 root_hash(root) = tagged_hash("BIPXXX_ROOT", root)
 ```
 
-`shuffle_key(keys_digest)` is the tagged hash of `keys_digest` using the
-`BIPXXX_SHUFFLE` tag. `shuffle_order(key)` returns the shuffled list of 256 byte
-offsets.
+`shuffle_key(policy_id, keychain, tree_start)` is the tagged hash of
+`concat(policy_id, be32(keychain), be32(tree_start))` using the
+`BIPXXX_SHUFFLE` tag.
+`shuffle_order(key)` returns the shuffled list of 256 byte offsets.
 
 The following three requirements each apply to every implementation:
 
-1. The shuffle order is derived from the descriptor keys digest. Implementations
-   MUST NOT use tree position as the derivation index.
+1. The shuffle order is derived from the wallet policy id, the keychain, and
+   the tree start. Implementations MUST NOT use tree position as the derivation
+   index.
 
 2. A tree has exactly 256 leaves. Implementations MUST NOT use a different
    tree size.
@@ -186,7 +204,7 @@ A proof consists of a nonce, a tree position, and one sibling per level.
 
 ```
 proof = { nonce: 32 bytes,
-          position: u32,
+          position: u8,
           siblings: [32 bytes; 8] }
 
 verify(address, proof, pinned_root):
@@ -201,8 +219,9 @@ verify(address, proof, pinned_root):
     return root_hash(node) == pinned_root
 ```
 
-`position` is a 32-bit unsigned integer. `bit(position, level)` is bit `level`
-of `position`, with bit 0 being the least significant.
+`position` is the position of the leaf inside its tree, in the range
+0 to 255 (the tree start MUST NOT be added to it). `bit(position, level)` is
+bit `level` of `position`, with bit 0 being the least significant.
 
 `script_pubkey_of(address)` decodes the address to its scriptPubKey. When the
 address is already available as a scriptPubKey, decoding is not required.
@@ -212,8 +231,8 @@ arrives. Working memory is therefore constant regardless of tree size: 32 bytes
 for the running node plus one 32-byte sibling at a time. This is what makes the
 construction viable on constrained hardware such as a secure element.
 
-Proof size is fixed: nonce 32 bytes, position 4 bytes, and 8 siblings of 32
-bytes, for a total of 292 bytes.
+Proof size is fixed: nonce 32 bytes, position 1 byte, and 8 siblings of 32
+bytes, for a total of 289 bytes.
 
 ### Sender-side device flow
 
@@ -323,6 +342,14 @@ non-negligible time on a secure element. HMAC also makes the security argument
 simpler: under standard PRF assumptions, revealing one nonce leaks nothing
 about any other, which is the property the proof format relies on.
 
+**Per-tree chaincode reseed.** The rolling chaincode is reseeded from
+`policy_id`, the keychain, and `tree_start` at the start of every tree and is
+not threaded across trees. This keeps trees independent and makes a leaf nonce
+unique to its tree even when two trees overlap in derivation index space, which
+is possible because a tree start is not required to be 256-aligned. Binding the
+keychain keeps the receive and change trees of one wallet independent at equal
+starts.
+
 **Commitment to the scriptPubKey rather than the address string.** Address
 encodings vary: bech32 versus bech32m, casing on chain, future encodings.
 The scriptPubKey is the bytes that actually appear in the transaction, and is
@@ -330,9 +357,12 @@ what the verifier can extract unambiguously without an encoding decision.
 
 **Placement by keyed shuffle rather than by derivation index.** If leaves sat
 at their derivation index, the tree position would reveal the index, which
-leaks how many addresses the recipient has used and in what order. The shuffle is
-derived from the descriptor keys digest, so every wallet with the descriptor
-rebuilds the same tree without revealing the permutation to the sender.
+leaks how many addresses the recipient has used and in what order. The shuffle
+is bound to the wallet policy id, the keychain, and the tree start, so every
+wallet with the descriptor rebuilds the same trees without revealing any
+permutation to the sender, and two trees never share a permutation — including
+two trees of one wallet that differ only in keychain, and trees of two policies
+over the same keys.
 
 **Fisher-Yates rather than a keyed PRP.** A Feistel construction would give the
 same decorrelation and constant memory. It was rejected because it must be
@@ -350,8 +380,9 @@ hint rather than a binding selector.
 
 **Fixed 256-leaf tree.** A one-byte offset addresses every leaf in the tree,
 which makes proof serving simple and keeps proofs fixed-size. Larger address
-ranges are represented by building another 256-leaf tree with a later aligned
-start index, not by changing the tree shape.
+ranges are represented by building another 256-leaf tree at a later start
+index, not by changing the tree shape. The start is not required to be
+256-aligned.
 
 **No padding.** Every tree has exactly 256 real derivation slots. There is no
 partial tree and no padding leaf domain in this version.
@@ -368,6 +399,16 @@ recipient does not choose, typically the moment a new payment is already pending
 Signing each root under a stable identity key means a larger tree can be
 accepted automatically by any sender who stored the pubkey, converting a
 recurring coordination cost into a one-time one.
+
+The identity key is a public identifier. The recipient MAY publish it, and
+every root and every proof is bound to it. Senders, colluding or otherwise,
+can therefore link every revealed address to one identity. This is inherent,
+not incidental: a sender always knows they are paying the contact they
+requested the address from, so binding revealed addresses to a public identity
+tells the sender nothing they did not already know. The privacy guarantee of
+this proposal is scoped accordingly: a revealed address reveals nothing about
+addresses not revealed. Unlinkability of the identity itself, across senders
+or from the public, is out of scope.
 
 **Proof of Recipient.** Verification is transaction-independent, so it can
 happen once per address rather than once per signing session. Over animated QR
@@ -399,7 +440,7 @@ minimum:
   hashes, shuffled order, every branch hash, the root, and the signed
   commitment.
 - A multisig descriptor exercising xpub serialization, sort, and deduplication
-  in `key_digest`.
+  in `keys_digest`.
 - At least one full proof with its complete verification trace: the running
   node value before and after each level, the sibling consumed at each level,
   and the bit of `position` that selects the ordering at each level.

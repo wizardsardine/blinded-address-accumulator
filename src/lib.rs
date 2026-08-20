@@ -13,6 +13,7 @@ pub const LEAF_TAG: &[u8] = "BIPXXX_LEAF".as_bytes();
 pub const BRANCH_TAG: &[u8] = "BIPXXX_BRANCH".as_bytes();
 pub const ROOT_TAG: &[u8] = "BIPXXX_ROOT".as_bytes();
 pub const NONCE_TAG: &[u8] = "BIPXXX_NONCE".as_bytes();
+pub const POLICY_TAG: &[u8] = "BIPXXX_POLICY".as_bytes();
 
 pub fn leaf_nonce<C: Crypto>(
     chaincode: &[u8; 32],
@@ -45,23 +46,31 @@ pub fn branch_hash<C: Crypto>(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     engine.hash()
 }
 
+pub fn policy_hash<C: Crypto>(policy_id: &[u8; 32], keychain: u32, start_index: u32) -> [u8; 32] {
+    let mut engine = C::Sha256Engine::new_tagged(POLICY_TAG);
+    engine.input(policy_id);
+    engine.input(&keychain.to_be_bytes());
+    engine.input(&start_index.to_be_bytes());
+    engine.hash()
+}
+
 pub fn root_hash<C: Crypto>(root: &[u8; 32]) -> [u8; 32] {
     let mut engine = C::Sha256Engine::new_tagged(ROOT_TAG);
     engine.input(root);
     engine.hash()
 }
 
-pub fn final_tree<C: Crypto, T: TreeBuilder>(
-    mut chaincode: [u8; 32],
+pub fn generate_tree<C: Crypto, T: TreeBuilder>(
+    policy_id: [u8; 32],
     keys_digest: &[u8; 32],
     keychain: u32,
     start_index: u32,
     derivator: impl Fn(u32) -> Vec<u8>,
     mut tree: T,
-) -> ([u8; 32] /* chaincode */, T::Tree) {
-    assert!(start_index as usize % MAX_RANGE == 0);
+) -> T::Tree {
     assert!(start_index <= u32::MAX - (MAX_RANGE as u32 - 1));
 
+    let mut chaincode = policy_hash::<C>(&policy_id, keychain, start_index);
     let mut leaves = vec![[0u8; 32]; MAX_RANGE];
     let mut nonces = vec![[0u8; 32]; MAX_RANGE];
     for offset in 0..MAX_RANGE {
@@ -72,22 +81,18 @@ pub fn final_tree<C: Crypto, T: TreeBuilder>(
         leaves[offset] = leaf_hash::<C>(&derivator(index), &nonce);
     }
 
-    let mut nodes: Vec<[u8; 32]> = shuffle_order::<C>(shuffle_key::<C>(keys_digest))
-        .iter()
-        .enumerate()
-        .map(|(pos, offset)| {
-            let index = start_index + *offset as u32;
-            let hash = leaves[*offset as usize];
-            tree.leaf(
-                start_index + pos as u32,
-                index,
-                &hash,
-                &nonces[*offset as usize],
-            );
-            hash
-        })
-        .collect();
+    let mut nodes: Vec<[u8; 32]> =
+        shuffle_order::<C>(shuffle_key::<C>(&policy_id, keychain, start_index))
+            .iter()
+            .enumerate()
+            .map(|(pos, offset)| {
+                let index = start_index + *offset as u32;
+                let hash = leaves[*offset as usize];
+                tree.leaf(pos as u32, index, &hash, &nonces[*offset as usize]);
+                hash
+            })
+            .collect();
 
-    let root = root_hash::<C>(&collapse::<C>(&mut nodes, 0, start_index, &mut tree));
-    (chaincode, tree.finish(root))
+    let root = root_hash::<C>(&collapse::<C>(&mut nodes, &mut tree));
+    tree.finish(root)
 }

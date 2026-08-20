@@ -36,8 +36,7 @@ impl Tree {
         let mut siblings = [[0u8; 32]; HEIGHT];
         for (level, sibling) in siblings.iter_mut().enumerate() {
             let pos = sibling_position(proof.position, level as u8);
-            let start = self.start_index >> level;
-            *sibling = self.levels[level][(pos - start) as usize].hash;
+            *sibling = self.levels[level][pos as usize].hash;
         }
 
         proof.siblings = Some(siblings);
@@ -71,8 +70,9 @@ pub fn verify_proof<C: Crypto>(script: &[u8], leaf: &Leaf, root: &[u8; 32]) -> b
 pub trait TreeBuilder {
     type Tree;
 
-    /// Level 0. `pos` is the global tree position; `index` is the derivation
-    /// index that produced it. The keyed shuffle means these do not correlate.
+    /// Level 0. `pos` is the position within this tree; `index` is the
+    /// derivation index that produced it. The keyed shuffle means these do not
+    /// correlate.
     fn leaf(&mut self, pos: u32, index: u32, hash: &[u8; 32], nonce: &[u8; 32]);
 
     /// Level 1 and above, increasing upward.
@@ -130,10 +130,7 @@ impl TreeBuilder for ProofTreeBuilder {
         assert!(offset < MAX_RANGE);
         assert!(self.leaves[offset].is_none());
 
-        let local_pos = pos
-            .checked_sub(self.start_index)
-            .expect("leaf position below tree start") as usize;
-        self.levels[0][local_pos] = Node {
+        self.levels[0][pos as usize] = Node {
             position: pos,
             hash: *hash,
         };
@@ -145,13 +142,7 @@ impl TreeBuilder for ProofTreeBuilder {
     }
 
     fn node(&mut self, level: u8, node: Node) {
-        let level = level as usize;
-        let level_start = self.start_index >> level;
-        let local_pos = node
-            .position
-            .checked_sub(level_start)
-            .expect("node position below tree start") as usize;
-        self.levels[level][local_pos] = node;
+        self.levels[level as usize][node.position as usize] = node;
     }
 
     fn finish(self, root: [u8; 32]) -> Self::Tree {
@@ -172,16 +163,10 @@ impl TreeBuilder for ProofTreeBuilder {
 /// Collapse a power-of-two slice bottom-up, emitting every level it computes.
 /// The input level is NOT emitted. The caller is responsible for that, since
 /// only the caller knows whether those nodes are leaves or subroots.
-pub fn collapse<C: Crypto>(
-    nodes: &mut Vec<[u8; 32]>,
-    base_level: u8,
-    base_pos: u32,
-    tree: &mut impl TreeBuilder,
-) -> [u8; 32] {
+pub fn collapse<C: Crypto>(nodes: &mut Vec<[u8; 32]>, tree: &mut impl TreeBuilder) -> [u8; 32] {
     assert!(nodes.len().is_power_of_two());
 
-    let mut level = base_level;
-    let mut pos = base_pos;
+    let mut level = 0u8;
 
     while nodes.len() > 1 {
         for i in 0..nodes.len() / 2 {
@@ -189,12 +174,11 @@ pub fn collapse<C: Crypto>(
         }
         nodes.truncate(nodes.len() / 2);
         level += 1;
-        pos /= 2;
         for (i, h) in nodes.iter().enumerate() {
             tree.node(
                 level,
                 Node {
-                    position: pos + i as u32,
+                    position: i as u32,
                     hash: *h,
                 },
             );
